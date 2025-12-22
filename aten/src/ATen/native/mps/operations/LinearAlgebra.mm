@@ -28,6 +28,7 @@
 #include <ATen/ops/linalg_inv_ex_native.h>
 #include <ATen/ops/linalg_lu_factor_ex_native.h>
 #include <ATen/ops/linalg_lu_factor_native.h>
+#include <ATen/ops/linalg_qr_native.h>
 #include <ATen/ops/linalg_solve_triangular_native.h>
 #include <ATen/ops/lu_unpack_native.h>
 #include <ATen/ops/mm_native.h>
@@ -1310,6 +1311,74 @@ static Tensor& orgqr_stub_impl(Tensor& self, const Tensor& tau) {
   return self;
 }
 
+static void linalg_qr_out_mps_impl(const Tensor& A, const c10::string_view mode, const Tensor& Q, const Tensor& R) {
+  using namespace mps;
+
+  TORCH_CHECK(A.scalar_type() == kFloat, "linalg_qr: MPS currently supports float32 only");
+  TORCH_CHECK(!A.is_complex(), "linalg_qr: MPS does not support complex types yet");
+
+  if (A.numel() == 0) {
+    return;
+  }
+
+  auto m = A.size(-2);
+  auto n = A.size(-1);
+
+  TORCH_CHECK(m >= n, "linalg_qr: MPS requires m >= n");
+  TORCH_CHECK(n <= 512, "linalg_qr: MPS currently supports n <= 512");
+
+  bool reduced_mode = (mode != "complete");
+  auto k = reduced_mode ? std::min(m, n) : m;
+
+  auto A_work = A.clone(at::MemoryFormat::Contiguous);
+  TORCH_CHECK(A_work.stride(-1) == 1, "A_work must be row-major, stride(-1)=", A_work.stride(-1));
+  TORCH_CHECK(A_work.stride(-2) == n, "A_work must be row-major, stride(-2)=", A_work.stride(-2), " n=", n);
+
+  QrParams params;
+  params.m = m;
+  params.n = n;
+  params.reduced_mode = (uint32_t)reduced_mode;
+  params.num_batch_dims = A.dim() - 2;
+
+  auto info = at::zeros({1}, A.options().dtype(kInt));
+
+  MPSStream* stream = getCurrentMPSStream();
+
+  Tensor Q_work = at::empty({m, m}, A.options());
+  Tensor R_work = at::empty({m, n}, A.options());
+  Tensor v_work = at::empty({m}, A.options());
+
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto compute_encoder = stream->commandEncoder();
+      auto pso = lib.getPipelineStateForFunc(fmt::format("linalg_qr_householder_{}", scalarToMetalTypeString(A)));
+
+      getMPSProfiler().beginProfileKernel(pso, "linalg_qr", {A});
+      [compute_encoder setComputePipelineState:pso];
+
+      MTLSize threadGroupSize = MTLSizeMake(32, 1, 1);
+      MTLSize gridSize = MTLSizeMake(1, 1, 1);
+
+      mtl_setArgs(compute_encoder, A_work, Q_work, R_work, info, params, v_work);
+      [compute_encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
+
+      getMPSProfiler().endProfileKernel(pso);
+    }
+  });
+
+  if (reduced_mode) {
+    Q.copy_(Q_work.narrow(1, 0, n));
+    R.copy_(R_work.narrow(0, 0, n));
+  } else {
+    Q.copy_(Q_work);
+    R.copy_(R_work);
+  }
+
+  if (info.item<int>() != 0) {
+    TORCH_CHECK(false, "linalg_qr: MPS kernel failed with error code ", info.item<int>());
+  }
+}
+
 } // namespace mps
 
 Tensor addr_mps(const Tensor& self, const Tensor& vec1, const Tensor& vec2, const Scalar& beta, const Scalar& alpha) {
@@ -1543,6 +1612,10 @@ TORCH_IMPL_FUNC(linalg_lu_factor_ex_out_mps)
 
 TORCH_IMPL_FUNC(linalg_inv_ex_out_mps)(const Tensor& A, bool check_errors, const Tensor& result, const Tensor& info) {
   mps::linalg_inv_ex_out_mps_impl(A, check_errors, result, info);
+}
+
+TORCH_IMPL_FUNC(linalg_qr_out_mps)(const Tensor& A, c10::string_view mode, const Tensor& Q, const Tensor& R) {
+  mps::linalg_qr_out_mps_impl(A, mode, Q, R);
 }
 
 REGISTER_DISPATCH(cholesky_stub, mps::cholesky_stub_impl)

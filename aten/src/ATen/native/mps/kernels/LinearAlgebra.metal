@@ -801,6 +801,204 @@ kernel void orgqr(
   }
 }
 
+template <typename T>
+static T parallel_reduce_sum(
+    T local_value,
+    uint32_t tid,
+    threadgroup T* scratch) {
+  if (tid < 8) {
+    scratch[tid] = 0.0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  T simd_sum_val = simd_sum(local_value);
+  if (tid % 32 == 0) {
+    scratch[tid / 32] = simd_sum_val;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (tid == 0) {
+    T sum = 0.0;
+    for (uint32_t i = 0; i < 8; i++) {
+      sum += scratch[i];
+    }
+    scratch[0] = sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  return scratch[0];
+}
+
+template <typename T, typename OpT>
+static void apply_householder_left(
+    device T* col_ptr,
+    uint32_t col_stride,
+    device T* v,
+    OpT tau,
+    uint32_t start_row,
+    uint32_t end_row,
+    uint32_t tid,
+    uint32_t group_size,
+    threadgroup OpT* scratch) {
+
+  OpT dot = 0.0;
+  for (uint32_t i = start_row + tid; i < end_row; i += group_size) {
+    OpT v_i = static_cast<OpT>(v[i]);
+    OpT col_i = static_cast<OpT>(col_ptr[i * col_stride]);
+    dot = fma(v_i, col_i, dot);
+  }
+
+  OpT vt_col = parallel_reduce_sum(dot, tid, scratch);
+  OpT factor = tau * vt_col;
+
+  // col = col - factor * v
+  for (uint32_t i = start_row + tid; i < end_row; i += group_size) {
+    OpT v_i = static_cast<OpT>(v[i]);
+    OpT col_i = static_cast<OpT>(col_ptr[i * col_stride]);
+    col_ptr[i * col_stride] = static_cast<T>(col_i - v_i * factor);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+}
+
+template <typename T, typename OpT>
+static void apply_householder_right(
+    device T* row_ptr,
+    uint32_t row_stride,
+    device T* v,
+    OpT tau,
+    uint32_t start_col,
+    uint32_t end_col,
+    uint32_t tid,
+    uint32_t group_size,
+    threadgroup OpT* scratch) {
+
+  OpT dot = 0.0;
+  for (uint32_t j = start_col + tid; j < end_col; j += group_size) {
+    OpT v_j = static_cast<OpT>(v[j]);
+    OpT row_j = static_cast<OpT>(row_ptr[j * row_stride]);
+    dot = fma(row_j, v_j, dot);
+  }
+
+  OpT row_v = parallel_reduce_sum(dot, tid, scratch);
+  OpT factor = tau * row_v;
+
+  // row = row - factor * v^T
+  for (uint32_t j = start_col + tid; j < end_col; j += group_size) {
+    OpT v_j = static_cast<OpT>(v[j]);
+    OpT row_j = static_cast<OpT>(row_ptr[j * row_stride]);
+    row_ptr[j * row_stride] = static_cast<T>(row_j - v_j * factor);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+}
+
+template <typename T>
+kernel void linalg_qr_householder(
+    device T* A [[buffer(0)]],
+    device T* Q [[buffer(1)]],
+    device T* R [[buffer(2)]],
+    device int* info [[buffer(3)]],
+    constant QrParams<>& params [[buffer(4)]],
+    device T* v_work [[buffer(5)]],
+    uint3 thread_pos [[thread_position_in_threadgroup]],
+    uint3 tpg [[threads_per_threadgroup]]) {
+
+  using opmath_t = c10::metal::opmath_t<T>;
+
+  const uint32_t tid = thread_pos.x;
+  const uint32_t group_size = tpg.x;
+  const uint32_t m = params.m;
+  const uint32_t n = params.n;
+
+  threadgroup opmath_t scratch[256];
+  threadgroup opmath_t tau_shared;
+
+  // initialize Q = Identity (m x m)
+  for (uint32_t i = tid; i < m * m; i += group_size) {
+    Q[i] = static_cast<T>((i / m == i % m) ? 1.0 : 0.0);
+  }
+
+  // initialize R = A (m x n)
+  for (uint32_t i = tid; i < m * n; i += group_size) {
+    R[i] = A[i];
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+
+  for (uint32_t k = 0; k < n; k++) {
+
+    // Step 1: compute norm of R[k:m, k] and copy to v_work
+    opmath_t norm_sq = 0.0;
+    for (uint32_t i = k + tid; i < m; i += group_size) {
+      opmath_t val = static_cast<opmath_t>(R[i * n + k]);
+      v_work[i] = static_cast<T>(val);
+      norm_sq = fma(val, val, norm_sq);
+    }
+    opmath_t norm = sqrt(parallel_reduce_sum(norm_sq, tid, scratch));
+
+    // Step 2: compute Householder vector and tau
+    if (tid == 0) {
+      constexpr opmath_t eps = 1e-10;
+      if (fabs(norm) < eps) {
+        tau_shared = 0.0;
+      } else {
+        opmath_t alpha = static_cast<opmath_t>(v_work[k]);
+        opmath_t sign_alpha = (alpha >= 0.0) ? 1.0 : -1.0;
+        opmath_t beta = sign_alpha * norm;
+        opmath_t u1 = alpha + beta;
+
+        tau_shared = 1.0 + fabs(alpha) / norm;
+
+        v_work[k] = static_cast<T>(1.0); // always 1 by construction
+        for (uint32_t i = k + 1; i < m; i++) {
+          v_work[i] = static_cast<T>(static_cast<opmath_t>(v_work[i]) / u1);
+        }
+
+        R[k * n + k] = static_cast<T>(-beta);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    opmath_t tau = tau_shared;
+    if (tau < 1e-10) continue;
+
+    // (zero out column k below diagonal)
+    for (uint32_t i = k + 1 + tid; i < m; i += group_size) {
+      R[i * n + k] = static_cast<T>(0.0);
+    }
+
+    // Step 3: apply reflection to trailing columns of R
+    for (uint32_t j = k + 1; j < n; j++) {
+      apply_householder_left(
+          R + j, n, v_work, tau, k, m, tid, group_size, scratch);
+    }
+
+    // Step 4: accumulate Q = Q * H_k
+    for (uint32_t i = 0; i < m; i++) {
+      apply_householder_right(
+          Q + i * m, 1, v_work, tau, k, m, tid, group_size, scratch);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+
+  if (tid == 0) {
+    info[0] = 0;
+  }
+}
+
+#define REGISTER_QR(T) \
+  template [[host_name("linalg_qr_householder_" #T)]] \
+  kernel void linalg_qr_householder<T>( \
+      device T* A [[buffer(0)]], \
+      device T* Q [[buffer(1)]], \
+      device T* R [[buffer(2)]], \
+      device int* info [[buffer(3)]], \
+      constant QrParams<>& params [[buffer(4)]], \
+      device T* v_work [[buffer(5)]], \
+      uint3 tid [[thread_position_in_threadgroup]], \
+      uint3 tpg [[threads_per_threadgroup]]);
+
+REGISTER_QR(float);
+
 #define INSTANTIATE_MM_OPS(DTYPE)                                           \
   template [[host_name("matmul_" #DTYPE)]] kernel void matmul<DTYPE>(       \
       constant DTYPE * mat1Data [[buffer(0)]],                              \
