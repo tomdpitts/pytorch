@@ -1311,6 +1311,167 @@ static Tensor& orgqr_stub_impl(Tensor& self, const Tensor& tau) {
   return self;
 }
 
+// static void tsqr_mps_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode);
+
+// Currently working for n <=512, supports batched input
+static void metal_qr_kernel_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode) {
+  using namespace mps;
+
+  auto m = A.size(-2);
+  auto n = A.size(-1);
+
+  int64_t batch_size = 1;
+  for (int64_t i = 0; i < A.dim() - 2; i++) {
+    batch_size *= A.size(i);
+  }
+
+  auto A_work = A.reshape({batch_size, m, n}).clone(at::MemoryFormat::Contiguous);
+
+  QrParams params;
+  params.m = m;
+  params.n = n;
+  params.reduced_mode = (uint32_t)reduced_mode;
+  params.num_batch_dims = A.dim() - 2;
+
+  auto info = at::zeros({1}, A.options().dtype(kInt));
+  MPSStream* stream = getCurrentMPSStream();
+
+  Tensor Q_work = at::empty({batch_size, m, m}, A.options());
+  Tensor R_work = at::empty({batch_size, m, n}, A.options());
+  Tensor v_work = at::empty({batch_size, m}, A.options());
+
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto compute_encoder = stream->commandEncoder();
+      auto pso = lib.getPipelineStateForFunc(fmt::format("linalg_qr_householder_{}", scalarToMetalTypeString(A)));
+
+      getMPSProfiler().beginProfileKernel(pso, "linalg_qr", {A});
+      [compute_encoder setComputePipelineState:pso];
+
+      MTLSize threadGroupSize = MTLSizeMake(1024, 1, 1);
+      // one threadgroup per matrix in batch
+      MTLSize gridSize = MTLSizeMake(batch_size, 1, 1);
+
+      mtl_setArgs(compute_encoder, A_work, Q_work, R_work, info, params, v_work);
+      [compute_encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
+
+      getMPSProfiler().endProfileKernel(pso);
+    }
+  });
+
+  bool is_batched = A.dim() > 2;
+
+  if (reduced_mode) {
+    auto Q_reduced = Q_work.narrow(-1, 0, n);  // [batch, m, n]
+    auto R_reduced = R_work.narrow(-2, 0, n);  // [batch, n, n]
+
+    if (is_batched) {
+      Q.copy_(Q_reduced.reshape(Q.sizes()));
+      R.copy_(R_reduced.reshape(R.sizes()));
+    } else {
+      Q.copy_(Q_reduced.squeeze(0));
+      R.copy_(R_reduced.squeeze(0));
+    }
+  } else {
+    // Q=mxm, R=mxn
+    if (is_batched) {
+      Q.copy_(Q_work.reshape(Q.sizes()));
+      R.copy_(R_work.reshape(R.sizes()));
+    } else {
+      Q.copy_(Q_work.squeeze(0));
+      R.copy_(R_work.squeeze(0));
+    }
+  }
+
+  if (info.item<int>() != 0) {
+    TORCH_CHECK(false, "linalg_qr: MPS kernel failed with error code ", info.item<int>());
+  }
+}
+
+// // TSQR: Tall-Skinny QR algo for m >> n
+// // Using tree reduction to parallelize QR of tall matrices
+// static void tsqr_mps_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode) {
+//   auto m = A.size(-2);
+//   auto n = A.size(-1);
+
+//   int64_t tile_height = std::max(n, (int64_t)256);
+//   int64_t num_tiles = (m + tile_height - 1) / tile_height;
+
+//   if (num_tiles <= 1) {
+//     metal_qr_kernel_impl(A, Q, R, reduced_mode);
+//     return;
+//   }
+
+//   std::vector<Tensor> Q_tiles;
+//   std::vector<Tensor> R_tiles;
+
+//   for (int64_t t = 0; t < num_tiles; t++) {
+//     int64_t start = t * tile_height;
+//     int64_t end = std::min((t + 1) * tile_height, m);
+//     int64_t tile_m = end - start;
+
+//     auto tile = A.slice(0, start, end);
+
+//     auto Q_tile = at::empty({tile_m, n}, A.options());
+//     auto R_tile = at::empty({n, n}, A.options());
+
+//     metal_qr_kernel_impl(tile, Q_tile, R_tile, true);
+
+//     Q_tiles.push_back(Q_tile);
+//     R_tiles.push_back(R_tile);
+//   }
+
+//   // Tree reduction - stack R matrices and QR
+//   auto R_stack = at::zeros({num_tiles * n, n}, A.options());
+//   for (int64_t t = 0; t < num_tiles; t++) {
+//     R_stack.slice(0, t * n, (t + 1) * n).copy_(R_tiles[t]);
+//   }
+
+//   // recursively QR stacked R matrices
+//   Tensor Q_reduce, R_final;
+//   if (R_stack.size(0) > 4 * n) {
+//     Q_reduce = at::empty({R_stack.size(0), n}, A.options());
+//     R_final = at::empty({n, n}, A.options());
+//     tsqr_mps_impl(R_stack, Q_reduce, R_final, true);
+//   } else {
+//     Q_reduce = at::empty({R_stack.size(0), n}, A.options());
+//     R_final = at::empty({n, n}, A.options());
+//     metal_qr_kernel_impl(R_stack, Q_reduce, R_final, true);
+//   }
+
+//   // multiply Q_tiles with corresponding blocks of Q_reduce
+//   // Q_final = block_diag(Q_tiles) @ Q_reduce
+//   auto Q_full = at::zeros({m, n}, A.options());
+//   for (int64_t t = 0; t < num_tiles; t++) {
+//     int64_t start = t * tile_height;
+//     int64_t end = std::min((t + 1) * tile_height, m);
+
+//     // Q_reduce block for this tile: rows (t*n) to ((t+1)*n)
+//     auto Q_reduce_block = Q_reduce.slice(0, t * n, std::min((t + 1) * n, Q_reduce.size(0)));
+
+//     // Q_full[start:end, :] = Q_tiles[t] @ Q_reduce_block
+//     Q_full.slice(0, start, end).copy_(Q_tiles[t].mm(Q_reduce_block));
+//   }
+
+//   if (reduced_mode) {
+//     Q.copy_(Q_full);
+//     R.copy_(R_final);
+//   } else {
+//     // Q needs to be mxm if not reduced
+//     Q.slice(1, 0, n).copy_(Q_full);
+//     if (m > n) {
+//       Q.slice(1, n, m).zero_();
+//       for (int64_t i = n; i < m; i++) {
+//         Q[i][i] = 1.0;
+//       }
+//     }
+//     R.slice(0, 0, n).copy_(R_final);
+//     if (m > n) {
+//       R.slice(0, n, m).zero_();
+//     }
+//   }
+// }
+
 static void linalg_qr_out_mps_impl(const Tensor& A, const c10::string_view mode, const Tensor& Q, const Tensor& R) {
   using namespace mps;
 
@@ -1328,54 +1489,11 @@ static void linalg_qr_out_mps_impl(const Tensor& A, const c10::string_view mode,
   TORCH_CHECK(n <= 512, "linalg_qr: MPS currently supports n <= 512");
 
   bool reduced_mode = (mode != "complete");
-  auto k = reduced_mode ? std::min(m, n) : m;
 
-  auto A_work = A.clone(at::MemoryFormat::Contiguous);
-  TORCH_CHECK(A_work.stride(-1) == 1, "A_work must be row-major, stride(-1)=", A_work.stride(-1));
-  TORCH_CHECK(A_work.stride(-2) == n, "A_work must be row-major, stride(-2)=", A_work.stride(-2), " n=", n);
-
-  QrParams params;
-  params.m = m;
-  params.n = n;
-  params.reduced_mode = (uint32_t)reduced_mode;
-  params.num_batch_dims = A.dim() - 2;
-
-  auto info = at::zeros({1}, A.options().dtype(kInt));
-
-  MPSStream* stream = getCurrentMPSStream();
-
-  Tensor Q_work = at::empty({m, m}, A.options());
-  Tensor R_work = at::empty({m, n}, A.options());
-  Tensor v_work = at::empty({m}, A.options());
-
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto compute_encoder = stream->commandEncoder();
-      auto pso = lib.getPipelineStateForFunc(fmt::format("linalg_qr_householder_{}", scalarToMetalTypeString(A)));
-
-      getMPSProfiler().beginProfileKernel(pso, "linalg_qr", {A});
-      [compute_encoder setComputePipelineState:pso];
-
-      MTLSize threadGroupSize = MTLSizeMake(32, 1, 1);
-      MTLSize gridSize = MTLSizeMake(1, 1, 1);
-
-      mtl_setArgs(compute_encoder, A_work, Q_work, R_work, info, params, v_work);
-      [compute_encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
-
-      getMPSProfiler().endProfileKernel(pso);
-    }
-  });
-
-  if (reduced_mode) {
-    Q.copy_(Q_work.narrow(1, 0, n));
-    R.copy_(R_work.narrow(0, 0, n));
+  if (m > 4 * n && n <= 512) {
+    tsqr_mps_impl(A, Q, R, reduced_mode);
   } else {
-    Q.copy_(Q_work);
-    R.copy_(R_work);
-  }
-
-  if (info.item<int>() != 0) {
-    TORCH_CHECK(false, "linalg_qr: MPS kernel failed with error code ", info.item<int>());
+    metal_qr_kernel_impl(A, Q, R, reduced_mode);
   }
 }
 

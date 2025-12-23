@@ -805,21 +805,25 @@ template <typename T>
 static T parallel_reduce_sum(
     T local_value,
     uint32_t tid,
+    uint32_t group_size,
     threadgroup T* scratch) {
-  if (tid < 8) {
+  uint32_t num_simd_groups = group_size / 32;
+  if (tid < num_simd_groups) {
     scratch[tid] = 0.0;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  // reduce within each SIMD group
   T simd_sum_val = simd_sum(local_value);
   if (tid % 32 == 0) {
     scratch[tid / 32] = simd_sum_val;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  // sum across all SIMD groups
   if (tid == 0) {
     T sum = 0.0;
-    for (uint32_t i = 0; i < 8; i++) {
+    for (uint32_t i = 0; i < num_simd_groups; i++) {
       sum += scratch[i];
     }
     scratch[0] = sum;
@@ -829,6 +833,7 @@ static T parallel_reduce_sum(
   return scratch[0];
 }
 
+/*
 template <typename T, typename OpT>
 static void apply_householder_left(
     device T* col_ptr,
@@ -848,7 +853,7 @@ static void apply_householder_left(
     dot = fma(v_i, col_i, dot);
   }
 
-  OpT vt_col = parallel_reduce_sum(dot, tid, scratch);
+  OpT vt_col = parallel_reduce_sum(dot, tid, group_size, scratch);
   OpT factor = tau * vt_col;
 
   // col = col - factor * v
@@ -879,7 +884,7 @@ static void apply_householder_right(
     dot = fma(row_j, v_j, dot);
   }
 
-  OpT row_v = parallel_reduce_sum(dot, tid, scratch);
+  OpT row_v = parallel_reduce_sum(dot, tid, group_size, scratch);
   OpT factor = tau * row_v;
 
   // row = row - factor * v^T
@@ -889,7 +894,7 @@ static void apply_householder_right(
     row_ptr[j * row_stride] = static_cast<T>(row_j - v_j * factor);
   }
   threadgroup_barrier(mem_flags::mem_device);
-}
+}*/
 
 template <typename T>
 kernel void linalg_qr_householder(
@@ -900,7 +905,8 @@ kernel void linalg_qr_householder(
     constant QrParams<>& params [[buffer(4)]],
     device T* v_work [[buffer(5)]],
     uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 tpg [[threads_per_threadgroup]]) {
+    uint3 tpg [[threads_per_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]]) {
 
   using opmath_t = c10::metal::opmath_t<T>;
 
@@ -909,30 +915,42 @@ kernel void linalg_qr_householder(
   const uint32_t m = params.m;
   const uint32_t n = params.n;
 
+  // Batch indexing
+  const uint32_t batch_idx = tg_pos.x;
+  const uint32_t A_stride = m * n;
+  const uint32_t Q_stride = m * m;
+  const uint32_t R_stride = m * n;
+  const uint32_t v_stride = m;
+
+  device T* A_batch = A + batch_idx * A_stride;
+  device T* Q_batch = Q + batch_idx * Q_stride;
+  device T* R_batch = R + batch_idx * R_stride;
+  device T* v_batch = v_work + batch_idx * v_stride;
+
   threadgroup opmath_t scratch[256];
   threadgroup opmath_t tau_shared;
 
   // initialize Q = Identity (m x m)
   for (uint32_t i = tid; i < m * m; i += group_size) {
-    Q[i] = static_cast<T>((i / m == i % m) ? 1.0 : 0.0);
+    Q_batch[i] = static_cast<T>((i / m == i % m) ? 1.0 : 0.0);
   }
 
   // initialize R = A (m x n)
   for (uint32_t i = tid; i < m * n; i += group_size) {
-    R[i] = A[i];
+    R_batch[i] = A_batch[i];
   }
   threadgroup_barrier(mem_flags::mem_device);
 
   for (uint32_t k = 0; k < n; k++) {
 
-    // Step 1: compute norm of R[k:m, k] and copy to v_work
+    // Step 1: compute norm of R[k:m, k] and copy to v_batch
     opmath_t norm_sq = 0.0;
     for (uint32_t i = k + tid; i < m; i += group_size) {
-      opmath_t val = static_cast<opmath_t>(R[i * n + k]);
-      v_work[i] = static_cast<T>(val);
+      opmath_t val = static_cast<opmath_t>(R_batch[i * n + k]);
+      v_batch[i] = static_cast<T>(val);
       norm_sq = fma(val, val, norm_sq);
     }
-    opmath_t norm = sqrt(parallel_reduce_sum(norm_sq, tid, scratch));
+    opmath_t norm = sqrt(parallel_reduce_sum(norm_sq, tid, group_size, scratch));
 
     // Step 2: compute Householder vector and tau
     if (tid == 0) {
@@ -940,19 +958,19 @@ kernel void linalg_qr_householder(
       if (fabs(norm) < eps) {
         tau_shared = 0.0;
       } else {
-        opmath_t alpha = static_cast<opmath_t>(v_work[k]);
+        opmath_t alpha = static_cast<opmath_t>(v_batch[k]);
         opmath_t sign_alpha = (alpha >= 0.0) ? 1.0 : -1.0;
         opmath_t beta = sign_alpha * norm;
         opmath_t u1 = alpha + beta;
 
         tau_shared = 1.0 + fabs(alpha) / norm;
 
-        v_work[k] = static_cast<T>(1.0); // always 1 by construction
+        v_batch[k] = static_cast<T>(1.0); // always 1 by construction
         for (uint32_t i = k + 1; i < m; i++) {
-          v_work[i] = static_cast<T>(static_cast<opmath_t>(v_work[i]) / u1);
+          v_batch[i] = static_cast<T>(static_cast<opmath_t>(v_batch[i]) / u1);
         }
 
-        R[k * n + k] = static_cast<T>(-beta);
+        R_batch[k * n + k] = static_cast<T>(-beta);
       }
     }
     threadgroup_barrier(mem_flags::mem_device);
@@ -962,19 +980,60 @@ kernel void linalg_qr_householder(
 
     // (zero out column k below diagonal)
     for (uint32_t i = k + 1 + tid; i < m; i += group_size) {
-      R[i * n + k] = static_cast<T>(0.0);
+      R_batch[i * n + k] = static_cast<T>(0.0);
     }
 
     // Step 3: apply reflection to trailing columns of R
-    for (uint32_t j = k + 1; j < n; j++) {
-      apply_householder_left(
-          R + j, n, v_work, tau, k, m, tid, group_size, scratch);
+    // Parallelize across columns: each SIMD group (32 threads) handles one column
+    uint32_t simd_lane = tid % 32;
+    uint32_t simd_group_id = tid / 32;
+    uint32_t num_simd_groups = group_size / 32;
+
+    for (uint32_t j_base = k + 1; j_base < n; j_base += num_simd_groups) {
+      uint32_t j = j_base + simd_group_id;
+      if (j < n) {
+        // Each SIMD group computes dot product for its column
+        // Use SIMD reduction within the group
+        opmath_t dot = 0.0;
+        for (uint32_t i = k + simd_lane; i < m; i += 32) {
+          opmath_t v_i = static_cast<opmath_t>(v_batch[i]);
+          opmath_t r_ij = static_cast<opmath_t>(R_batch[i * n + j]);
+          dot = fma(v_i, r_ij, dot);
+        }
+        opmath_t vt_col = simd_sum(dot);
+        opmath_t factor = tau * vt_col;
+
+        // Update column
+        for (uint32_t i = k + simd_lane; i < m; i += 32) {
+          opmath_t v_i = static_cast<opmath_t>(v_batch[i]);
+          opmath_t r_ij = static_cast<opmath_t>(R_batch[i * n + j]);
+          R_batch[i * n + j] = static_cast<T>(r_ij - v_i * factor);
+        }
+      }
     }
+    threadgroup_barrier(mem_flags::mem_device);
 
     // Step 4: accumulate Q = Q * H_k
-    for (uint32_t i = 0; i < m; i++) {
-      apply_householder_right(
-          Q + i * m, 1, v_work, tau, k, m, tid, group_size, scratch);
+    // each SIMD group handles one row
+    for (uint32_t i_base = 0; i_base < m; i_base += num_simd_groups) {
+      uint32_t i = i_base + simd_group_id;
+      if (i < m) {
+        opmath_t dot = 0.0;
+        for (uint32_t j = k + simd_lane; j < m; j += 32) {
+          opmath_t v_j = static_cast<opmath_t>(v_batch[j]);
+          opmath_t q_ij = static_cast<opmath_t>(Q_batch[i * m + j]);
+          dot = fma(q_ij, v_j, dot);
+        }
+        opmath_t row_v = simd_sum(dot);
+        opmath_t factor = tau * row_v;
+
+        // Update row
+        for (uint32_t j = k + simd_lane; j < m; j += 32) {
+          opmath_t v_j = static_cast<opmath_t>(v_batch[j]);
+          opmath_t q_ij = static_cast<opmath_t>(Q_batch[i * m + j]);
+          Q_batch[i * m + j] = static_cast<T>(q_ij - v_j * factor);
+        }
+      }
     }
 
     threadgroup_barrier(mem_flags::mem_device);

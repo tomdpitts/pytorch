@@ -27,3 +27,11 @@ struct QrParams {
   ::c10::metal::array<uint32_t, N> Q_strides;
   ::c10::metal::array<uint32_t, N> R_strides;
 };
+
+template <unsigned N = c10::metal::max_ndim>
+struct QrPanelParams {
+  uint32_t m;
+  uint32_t n;
+  uint32_t k_start;
+  uint32_t k_end;
+};
