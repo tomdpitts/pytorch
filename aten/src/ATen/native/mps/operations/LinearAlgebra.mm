@@ -1490,11 +1490,7 @@ static void linalg_qr_out_mps_impl(const Tensor& A, const c10::string_view mode,
 
   bool reduced_mode = (mode != "complete");
 
-  if (m > 4 * n && n <= 512) {
-    tsqr_mps_impl(A, Q, R, reduced_mode);
-  } else {
-    metal_qr_kernel_impl(A, Q, R, reduced_mode);
-  }
+  metal_qr_kernel_impl(A, Q, R, reduced_mode);
 }
 
 } // namespace mps
