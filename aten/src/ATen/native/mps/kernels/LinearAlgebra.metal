@@ -1054,7 +1054,8 @@ kernel void linalg_qr_householder(
       constant QrParams<>& params [[buffer(4)]], \
       device T* v_work [[buffer(5)]], \
       uint3 tid [[thread_position_in_threadgroup]], \
-      uint3 tpg [[threads_per_threadgroup]]);
+      uint3 tpg [[threads_per_threadgroup]], \
+      uint3 tg_pos [[threadgroup_position_in_grid]]);
 
 REGISTER_QR(float);
 

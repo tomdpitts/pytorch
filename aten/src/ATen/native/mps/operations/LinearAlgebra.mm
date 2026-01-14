@@ -1311,9 +1311,6 @@ static Tensor& orgqr_stub_impl(Tensor& self, const Tensor& tau) {
   return self;
 }
 
-// static void tsqr_mps_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode);
-
-// Currently working for n <=512, supports batched input
 static void metal_qr_kernel_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode) {
   using namespace mps;
 
@@ -1362,8 +1359,8 @@ static void metal_qr_kernel_impl(const Tensor& A, const Tensor& Q, const Tensor&
   bool is_batched = A.dim() > 2;
 
   if (reduced_mode) {
-    auto Q_reduced = Q_work.narrow(-1, 0, n);  // [batch, m, n]
-    auto R_reduced = R_work.narrow(-2, 0, n);  // [batch, n, n]
+    auto Q_reduced = Q_work.narrow(-1, 0, n); // [batch, m, n]
+    auto R_reduced = R_work.narrow(-2, 0, n); // [batch, n, n]
 
     if (is_batched) {
       Q.copy_(Q_reduced.reshape(Q.sizes()));
@@ -1387,90 +1384,6 @@ static void metal_qr_kernel_impl(const Tensor& A, const Tensor& Q, const Tensor&
     TORCH_CHECK(false, "linalg_qr: MPS kernel failed with error code ", info.item<int>());
   }
 }
-
-// // TSQR: Tall-Skinny QR algo for m >> n
-// // Using tree reduction to parallelize QR of tall matrices
-// static void tsqr_mps_impl(const Tensor& A, const Tensor& Q, const Tensor& R, bool reduced_mode) {
-//   auto m = A.size(-2);
-//   auto n = A.size(-1);
-
-//   int64_t tile_height = std::max(n, (int64_t)256);
-//   int64_t num_tiles = (m + tile_height - 1) / tile_height;
-
-//   if (num_tiles <= 1) {
-//     metal_qr_kernel_impl(A, Q, R, reduced_mode);
-//     return;
-//   }
-
-//   std::vector<Tensor> Q_tiles;
-//   std::vector<Tensor> R_tiles;
-
-//   for (int64_t t = 0; t < num_tiles; t++) {
-//     int64_t start = t * tile_height;
-//     int64_t end = std::min((t + 1) * tile_height, m);
-//     int64_t tile_m = end - start;
-
-//     auto tile = A.slice(0, start, end);
-
-//     auto Q_tile = at::empty({tile_m, n}, A.options());
-//     auto R_tile = at::empty({n, n}, A.options());
-
-//     metal_qr_kernel_impl(tile, Q_tile, R_tile, true);
-
-//     Q_tiles.push_back(Q_tile);
-//     R_tiles.push_back(R_tile);
-//   }
-
-//   // Tree reduction - stack R matrices and QR
-//   auto R_stack = at::zeros({num_tiles * n, n}, A.options());
-//   for (int64_t t = 0; t < num_tiles; t++) {
-//     R_stack.slice(0, t * n, (t + 1) * n).copy_(R_tiles[t]);
-//   }
-
-//   // recursively QR stacked R matrices
-//   Tensor Q_reduce, R_final;
-//   if (R_stack.size(0) > 4 * n) {
-//     Q_reduce = at::empty({R_stack.size(0), n}, A.options());
-//     R_final = at::empty({n, n}, A.options());
-//     tsqr_mps_impl(R_stack, Q_reduce, R_final, true);
-//   } else {
-//     Q_reduce = at::empty({R_stack.size(0), n}, A.options());
-//     R_final = at::empty({n, n}, A.options());
-//     metal_qr_kernel_impl(R_stack, Q_reduce, R_final, true);
-//   }
-
-//   // multiply Q_tiles with corresponding blocks of Q_reduce
-//   // Q_final = block_diag(Q_tiles) @ Q_reduce
-//   auto Q_full = at::zeros({m, n}, A.options());
-//   for (int64_t t = 0; t < num_tiles; t++) {
-//     int64_t start = t * tile_height;
-//     int64_t end = std::min((t + 1) * tile_height, m);
-
-//     // Q_reduce block for this tile: rows (t*n) to ((t+1)*n)
-//     auto Q_reduce_block = Q_reduce.slice(0, t * n, std::min((t + 1) * n, Q_reduce.size(0)));
-
-//     // Q_full[start:end, :] = Q_tiles[t] @ Q_reduce_block
-//     Q_full.slice(0, start, end).copy_(Q_tiles[t].mm(Q_reduce_block));
-//   }
-
-//   if (reduced_mode) {
-//     Q.copy_(Q_full);
-//     R.copy_(R_final);
-//   } else {
-//     // Q needs to be mxm if not reduced
-//     Q.slice(1, 0, n).copy_(Q_full);
-//     if (m > n) {
-//       Q.slice(1, n, m).zero_();
-//       for (int64_t i = n; i < m; i++) {
-//         Q[i][i] = 1.0;
-//       }
-//     }
-//     R.slice(0, 0, n).copy_(R_final);
-//     if (m > n) {
-//       R.slice(0, n, m).zero_();
-//     }
-//   }
-// }
 
 static void linalg_qr_out_mps_impl(const Tensor& A, const c10::string_view mode, const Tensor& Q, const Tensor& R) {
   using namespace mps;
